@@ -1,0 +1,4 @@
+build/
+docs/
+.swarm/
+.DS_Store
