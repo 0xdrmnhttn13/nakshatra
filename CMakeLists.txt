@@ -12,6 +12,8 @@ set(POSSIBLE_SOURCES
     src/safetensors.cpp
     src/model.cpp
     src/ir.cpp
+    src/pass.cpp
+    src/passes.cpp
     src/lowering.cpp
     metal/metal_device.mm
 )
@@ -41,7 +43,13 @@ endif()
 enable_testing()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_golden.cpp")
-    add_executable(test_golden tests/test_golden.cpp)
-    target_link_libraries(test_golden PRIVATE nakshatra_core)
-    add_test(NAME golden COMMAND test_golden)
+  add_executable(test_golden tests/test_golden.cpp)
+  target_link_libraries(test_golden PRIVATE nakshatra_core)
+  add_test(NAME golden COMMAND test_golden)
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_passes.cpp")
+  add_executable(test_passes tests/test_passes.cpp)
+  target_link_libraries(test_passes PRIVATE nakshatra_core)
+  add_test(NAME passes COMMAND test_passes)
 endif()

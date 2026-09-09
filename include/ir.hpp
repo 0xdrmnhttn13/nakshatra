@@ -25,7 +25,8 @@ enum class OpKind {
   Attention,
   GELU,
   Multiply,
-  Add
+  Add,
+  FusedRMSNormLinear
 };
 
 struct Op {
@@ -44,6 +45,8 @@ public:
   const std::vector<Op> &ops() const { return ops_; }
   std::vector<Op> &ops() { return ops_; }
   const Op &defining_op(ValueId value) const;
+  std::size_t replace_all_uses(ValueId old_value, ValueId new_value);
+  std::size_t use_count(ValueId value) const;
   std::string dump() const;
 
 private:

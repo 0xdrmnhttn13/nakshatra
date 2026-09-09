@@ -26,6 +26,8 @@ static std::string kind_name(OpKind kind) {
     return "multiply";
   case OpKind::Add:
     return "add";
+  case OpKind::FusedRMSNormLinear:
+    return "fused_rmsnorm_linear";
   }
   return "unknown";
 }
@@ -82,6 +84,31 @@ const Op &Graph::defining_op(ValueId value) const {
     }
   }
   throw std::runtime_error("value has no defining operation");
+}
+
+std::size_t Graph::replace_all_uses(ValueId old_value, ValueId new_value) {
+  std::size_t replaced = 0;
+  for (Op &op : ops_) {
+    for (ValueId &input : op.inputs) {
+      if (input == old_value) {
+        input = new_value;
+        ++replaced;
+      }
+    }
+  }
+  return replaced;
+}
+
+std::size_t Graph::use_count(ValueId value) const {
+  std::size_t count = 0;
+  for (const Op &op : ops_) {
+    for (ValueId input : op.inputs) {
+      if (input == value) {
+        ++count;
+      }
+    }
+  }
+  return count;
 }
 
 void verify(const Graph &graph) {

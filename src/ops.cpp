@@ -17,12 +17,21 @@ float dot(const float *a, const float *b, std::size_t n) {
   return sum;
 }
 
+void linear(std::span<const float> x, std::span<const float> weight,
+            std::size_t out_features, std::size_t in_features,
+            std::span<float> y) {
+  for (std::size_t o = 0; o < out_features; ++o) {
+    y[o] = dot(x.data(), weight.data() + o * in_features, in_features);
+  }
+}
+
 void gemma_rmsnorm(std::span<const float> x, std::span<const float> weight,
                    float eps, std::span<float> y) {
   float mean_sq = 0.0f;
   for (float v : x) {
     mean_sq += v * v;
   }
+  mean_sq /= static_cast<float>(x.size());
   const float inv_rms = 1.0f / std::sqrt(mean_sq + eps);
   for (std::size_t i = 0; i < x.size(); ++i) {
     y[i] = x[i] * inv_rms * (1.0f + weight[i]);
@@ -39,7 +48,7 @@ float gelu_tanh(float x) {
 void gemma_mlp(std::span<const float> x, std::span<const float> gate_w,
                std::span<const float> up_w, std::span<const float> down_w,
                std::size_t hidden, std::size_t intermediate,
-               std::span<float> y, ) {
+                std::span<float> y) {
 
   std::vector<float> gate(intermediate);
   std::vector<float> up(intermediate);
