@@ -23,4 +23,18 @@ void softmax_inplace(std::span<float> x);
 
 void add_inplace(std::span<float> x, std::span<const float> residual);
 
+void normalize_heads(std::span<float> x, std::size_t num_heads,
+                     std::size_t head_dim, std::span<const float> norm_weight,
+                     float eps);
+
+std::size_t kv_head_for_q_head(std::size_t q_head, std::size_t num_q_heads,
+                               std::size_t num_kv_heads);
+
+float attention_scale(float query_pre_attn_scalar);
+
+void attend_one_head(std::span<const float> q, const float *key_base,
+                     const float *value_base, std::size_t seq_begin,
+                     std::size_t seq_end, std::size_t head_dim, float scale,
+                     std::span<float> out);
+
 } // namespace nakshatra

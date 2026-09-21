@@ -1,181 +1,275 @@
 #include "config.hpp"
-#include "ir.hpp"
+#include "exercises.hpp"
+#include "kv_cache.hpp"
+#include "metal_backend.hpp"
+#include "model.hpp"
 #include "ops.hpp"
+#include "safetensors.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <filesystem>
+#include <iomanip>
 #include <iostream>
-#include <limits>
+#include <random>
 #include <vector>
 
-static void exercise_shapes() {
+namespace {
+
+struct PhaseTimes {
+  double embed = 0;
+  double layers = 0;
+  double head = 0;
+};
+
+PhaseTimes profile_decode(const nakshatra::Gemma3Config &cfg,
+                          const nakshatra::ModelWeights &model,
+                          nakshatra::KVCache &cache, std::uint32_t token,
+                          std::size_t position) {
+  PhaseTimes t{};
+  using clock = std::chrono::steady_clock;
+
+  auto t0 = clock::now();
+  std::vector<float> x(cfg.hidden_size);
+  nakshatra::embed_token(cfg, model.embedding, token, x);
+  auto t1 = clock::now();
+
+  for (std::size_t layer = 0; layer < cfg.num_layers; ++layer) {
+    nakshatra::decoder_layer_decode(cfg, model.layers[layer], cache, layer,
+                                    position, x);
+  }
+  auto t2 = clock::now();
+
+  std::vector<float> normed(cfg.hidden_size);
+  nakshatra::gemma_rmsnorm(x, model.final_norm.span(), cfg.rms_eps, normed);
+
+  std::vector<float> logits(cfg.vocab_size);
+  nakshatra::compute_logits(cfg, model.embedding, normed, logits);
+  auto t3 = clock::now();
+
+  t.embed = std::chrono::duration<double>(t1 - t0).count();
+  t.layers = std::chrono::duration<double>(t2 - t1).count();
+  t.head = std::chrono::duration<double>(t3 - t2).count();
+  return t;
+}
+
+int run_profile() {
+  const std::filesystem::path path = "models/gemma-3-1b/model.safetensors";
+  if (!std::filesystem::exists(path)) {
+    std::cout << "model file not found\n";
+    return 1;
+  }
+
+  std::cout << "loading...\n";
   nakshatra::Gemma3Config cfg;
+  nakshatra::SafeTensorFile file = nakshatra::load_safetensors(path.string());
+  nakshatra::ModelWeights model = nakshatra::load_gemma_weights(file, cfg);
+  nakshatra::KVCache cache(cfg, 64);
 
-  const std::size_t q_dim = cfg.num_q_heads * cfg.head_dim;
-  const std::size_t kv_dim = cfg.num_kv_heads * cfg.head_dim;
+  const std::vector<std::uint32_t> prompt{2, 9259, 1902};
 
-  std::vector<float> x(cfg.hidden_size, 0.5f);
-
-  std::vector<float> w_q(q_dim * cfg.hidden_size, 0.01f);
-  std::vector<float> w_k(kv_dim * cfg.hidden_size, 0.01f);
-  std::vector<float> w_v(kv_dim * cfg.hidden_size, 0.01f);
-
-  std::vector<float> q(q_dim);
-  std::vector<float> k(kv_dim);
-  std::vector<float> v(kv_dim);
-
-  nakshatra::linear(x, w_q, q_dim, cfg.hidden_size, q);
-  nakshatra::linear(x, w_k, kv_dim, cfg.hidden_size, k);
-  nakshatra::linear(x, w_v, kv_dim, cfg.hidden_size, v);
-
-  std::cout << "q: " << q.size() << "\n";
-  std::cout << "k: " << k.size() << "\n";
-  std::cout << "v: " << v.size() << "\n";
-
-  std::cout << "q != hidden_size: "
-            << (q_dim != cfg.hidden_size ? "yes" : "NO - BUG") << "\n";
-}
-
-static void exercise_scaled_dot() {
-  const std::size_t head_dim = 4;
-  const std::size_t tokens = 3;
-
-  std::vector<float> q{1, 0, 0, 0};
-
-  std::vector<float> k{
-      1, 0, 0, 0, //
-      0, 1, 0, 0, //
-      0, 0, 1, 0  //
-  };
-
-  std::vector<float> v{
-      1, 0, 0, 0, //
-      0, 1, 0, 0, //
-      0, 0, 1, 0  //
-  };
-
-  const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-
-  std::vector<float> scores(tokens);
-
-  for (std::size_t t = 0; t < tokens; ++t) {
-    scores[t] =
-        nakshatra::dot(q.data(), k.data() + t * head_dim, head_dim) * scale;
+  std::uint32_t next = 0;
+  std::size_t pos = 0;
+  for (; pos < prompt.size(); ++pos) {
+    next = nakshatra::decode_one(cfg, model, cache, prompt[pos], pos);
   }
 
-  nakshatra::softmax_inplace(scores);
+  PhaseTimes total{};
+  const int steps = 5;
+  std::cout << "profiling " << steps << " tokens...\n";
 
-  std::vector<float> out(head_dim, 0.0f);
-
-  for (std::size_t t = 0; t < tokens; ++t) {
-    for (std::size_t d = 0; d < head_dim; ++d) {
-      out[d] += scores[t] * v[t * head_dim + d];
-    }
+  for (int i = 0; i < steps; ++i, ++pos) {
+    const PhaseTimes t = profile_decode(cfg, model, cache, next, pos);
+    total.embed += t.embed;
+    total.layers += t.layers;
+    total.head += t.head;
   }
 
-  std::cout << "scores: " << scores[0] << " " << scores[1] << " "
-            << scores[2] << "\n";
-
-  std::cout << "out:    " << out[0] << " " << out[1] << " " << out[2] << " "
-            << out[3] << "\n";
-}
-
-static void exercise_masking() {
-  const float neg_inf = -std::numeric_limits<float>::infinity();
-
-  std::vector<float> scores{0.5f, 0.0f, 0.0f};
-
-  std::vector<float> masked = scores;
-  masked[1] = neg_inf;
-
-  nakshatra::softmax_inplace(masked);
-
-  std::vector<float> windowed{scores[0], scores[2]};
-  nakshatra::softmax_inplace(windowed);
-
-  std::cout << "mask  : " << masked[0] << " " << masked[1] << " " << masked[2]
-            << "\n";
-
-  std::cout << "window: " << windowed[0] << " " << windowed[1] << "\n";
-
-  std::cout << "equal : "
-            << (masked[0] == windowed[0] && masked[2] == windowed[1] ? "yes"
-                                                                     : "NO - BUG")
-            << "\n";
-}
-
-static void exercise_heads() {
-  nakshatra::Gemma3Config cfg;
-
-  const std::size_t q_dim = cfg.num_q_heads * cfg.head_dim;
-  const std::size_t kv_dim = cfg.num_kv_heads * cfg.head_dim;
-
-  std::vector<float> q(q_dim);
-  std::vector<float> k(kv_dim);
-  std::vector<float> v(kv_dim);
-
-  std::cout << "Q logical shape: [" << cfg.num_q_heads << ", " << cfg.head_dim
-            << "]\n";
-
-  std::cout << "K logical shape: [" << cfg.num_kv_heads << ", "
-            << cfg.head_dim << "]\n";
-
-  std::cout << "V logical shape: [" << cfg.num_kv_heads << ", "
-            << cfg.head_dim << "]\n";
-
-  for (std::size_t h = 0; h < cfg.num_q_heads; ++h) {
-    std::size_t begin = h * cfg.head_dim;
-    std::size_t end = begin + cfg.head_dim - 1;
-
-    std::cout << "Q head " << h << " -> q[" << begin << ".." << end << "]\n";
-  }
-
-  for (std::size_t h = 0; h < cfg.num_kv_heads; ++h) {
-    std::size_t begin = h * cfg.head_dim;
-    std::size_t end = begin + cfg.head_dim - 1;
-
-    std::cout << "KV head " << h << " -> k/v[" << begin << ".." << end
-              << "]\n";
-  }
-}
-
-static void exercise_graph() {
-  nakshatra::Graph g;
-
-  nakshatra::TensorType f32_x{nakshatra::DType::F32, {1152}};
-  nakshatra::TensorType f32_w{nakshatra::DType::F32, {1024, 1152}};
-  nakshatra::TensorType f32_q{nakshatra::DType::F32, {1024}};
-
-  nakshatra::ValueId x = g.add_op(nakshatra::OpKind::Input, {}, f32_x, "x");
-  nakshatra::ValueId w =
-      g.add_op(nakshatra::OpKind::Constant, {}, f32_w, "q_proj");
-  nakshatra::ValueId q = g.add_op(nakshatra::OpKind::Linear, {x, w}, f32_q);
-  nakshatra::ValueId a = g.add_op(nakshatra::OpKind::GELU, {q}, f32_q);
-
-  std::cout << g.dump();
-
-  nakshatra::verify(g);
-  std::cout << "verify: ok\n";
-
-  nakshatra::Graph broken;
-  nakshatra::ValueId ghost = 7;
-  broken.add_op(nakshatra::OpKind::Linear, {ghost, x}, f32_q, "bad_linear");
-
-  try {
-    nakshatra::verify(broken);
-  } catch (const std::runtime_error &e) {
-    std::cout << "verify caught: " << e.what() << "\n";
-  }
-}
-
-int main() {
-  exercise_shapes();
-  std::cout << "---\n";
-  exercise_scaled_dot();
-  std::cout << "---\n";
-  exercise_masking();
-  std::cout << "---\n";
-  exercise_heads();
-  std::cout << "---\n";
-  exercise_graph();
+  const double all = total.embed + total.layers + total.head;
+  std::cout << "embed        : " << total.embed << "s ("
+            << 100.0 * total.embed / all << "%)\n";
+  std::cout << "26 layers    : " << total.layers << "s ("
+            << 100.0 * total.layers / all << "%)\n";
+  std::cout << "norm+logits  : " << total.head << "s ("
+            << 100.0 * total.head / all << "%)\n";
+  std::cout << "total        : " << all << "s (" << all / steps * 1000.0
+            << " ms/token)\n";
   return 0;
+}
+
+int run_app(bool metal_on, nakshatra::WeightFormat fmt) {
+  const std::filesystem::path path = "models/gemma-3-1b/model.safetensors";
+
+  if (!std::filesystem::exists(path)) {
+    std::cout << "model file not found: " << path << "\n";
+    std::cout << "download it first, or run './nakshatra --exercises'\n";
+    return 1;
+  }
+
+  nakshatra::global_metal().set_enabled(metal_on);
+  nakshatra::global_metal().set_weight_format(fmt);
+
+  const bool using_metal = nakshatra::global_metal().ok() && metal_on;
+
+  std::cout << "backend: "
+            << (using_metal
+                    ? (fmt == nakshatra::WeightFormat::BF16
+                           ? "metal, bf16 weights (2.4 GB gpu)"
+                           : "metal, f32 weights (4.8 GB gpu)")
+                    : "cpu")
+            << "\n";
+  std::cout << "loading gemma 3 1b (2 GB)...\n";
+  const auto t0 = std::chrono::steady_clock::now();
+
+  nakshatra::Gemma3Config cfg;
+  nakshatra::ModelWeights model;
+  {
+    nakshatra::SafeTensorFile file = nakshatra::load_safetensors(path.string());
+    model = nakshatra::load_gemma_weights(file, cfg);
+  }
+
+  const auto t1 = std::chrono::steady_clock::now();
+  std::cout << "weights loaded in "
+            << std::chrono::duration<double>(t1 - t0).count() << "s\n";
+
+  nakshatra::KVCache cache(cfg, 64);
+
+  const std::vector<std::uint32_t> prompt{2, 9259, 1902};
+
+  std::uint32_t next = 0;
+  std::size_t pos = 0;
+
+  for (; pos < prompt.size(); ++pos) {
+    next = nakshatra::decode_one(cfg, model, cache, prompt[pos], pos);
+  }
+
+  std::cout << "generated token ids:";
+  const auto t2 = std::chrono::steady_clock::now();
+
+  for (std::size_t step = 0; step < 12; ++step, ++pos) {
+    next = nakshatra::decode_one(cfg, model, cache, next, pos);
+    std::cout << " " << next << std::flush;
+  }
+
+  const auto t3 = std::chrono::steady_clock::now();
+  const double gen_s = std::chrono::duration<double>(t3 - t2).count();
+
+  std::cout << "\n12 tokens in " << gen_s << "s ("
+            << gen_s / 12.0 * 1000.0 << " ms/token, " << 12.0 / gen_s
+            << " tok/s)\n";
+
+  return 0;
+}
+
+} // namespace
+
+int run_metal() {
+  nakshatra::MetalMatvec metal;
+
+  if (!metal.ok()) {
+    std::cout << "metal device not available\n";
+    return 1;
+  }
+
+  std::cout << "metal matvec benchmark (naive kernel, fp32)\n";
+  std::cout << "shape             | cpu ms | metal ms | speedup | metal GB/s | "
+               "GFLOP/s\n";
+  std::cout << "-------------------------------------------------------------"
+               "-------------\n";
+
+  const std::vector<std::pair<std::size_t, std::size_t>> shapes{
+      {1024, 1152}, {6912, 1152}, {1152, 6912}, {262144, 1152}};
+
+  std::mt19937 gen(42);
+  std::uniform_real_distribution<float> dist(-0.02f, 0.02f);
+
+  for (const auto &[out, in] : shapes) {
+    std::vector<float> w(out * in);
+    for (float &v : w) {
+      v = dist(gen);
+    }
+    std::vector<float> x(in);
+    for (float &v : x) {
+      v = dist(gen);
+    }
+
+    std::vector<float> y_cpu(out, 0.0f);
+    std::vector<float> y_metal(out, 0.0f);
+
+    if (!metal.run(w.data(), x.data(), y_metal.data(), out, in)) {
+      std::cout << "metal run failed for shape " << out << "x" << in << "\n";
+      return 1;
+    }
+
+    nakshatra::linear(x, w, out, in, y_cpu);
+
+    double max_diff = 0.0;
+    for (std::size_t i = 0; i < out; ++i) {
+      max_diff = std::max(max_diff,
+                          std::abs(static_cast<double>(y_cpu[i]) -
+                                   static_cast<double>(y_metal[i])));
+    }
+
+    const std::size_t cpu_iters =
+        std::max<std::size_t>(3, std::min<std::size_t>(100, 400000000ull /
+                                                                  (out * in)));
+    const std::size_t gpu_iters =
+        std::max<std::size_t>(20, std::min<std::size_t>(400, 4000000000ull /
+                                                                   (out * in)));
+
+    const auto c0 = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < cpu_iters; ++i) {
+      nakshatra::linear(x, w, out, in, y_cpu);
+    }
+    const auto c1 = std::chrono::steady_clock::now();
+
+    const double cpu_s =
+        std::chrono::duration<double>(c1 - c0).count() / cpu_iters;
+    const double gpu_s = metal.bench(w.data(), x.data(), y_metal.data(), out,
+                                     in, 10, gpu_iters);
+
+    const double bytes =
+        static_cast<double>(out * in + in + out) * 4.0;
+    const double gbs = bytes / gpu_s / 1e9;
+    const double gflo = 2.0 * out * in / gpu_s / 1e9;
+
+    std::cout << std::left << std::setw(17) << (std::to_string(out) + "x" +
+                                                std::to_string(in))
+              << " | " << std::setw(6) << cpu_s * 1000.0 << " | "
+              << std::setw(8) << gpu_s * 1000.0 << " | " << std::setw(7)
+              << std::fixed << std::setprecision(1) << cpu_s / gpu_s << " | "
+              << std::setw(10) << gbs << " | " << std::setw(7) << gflo
+              << "  max diff " << max_diff << "\n";
+  }
+
+  return 0;
+}
+
+int main(int argc, char **argv) {
+  const std::string arg = argc > 1 ? argv[1] : "";
+
+  if (arg == "--exercises") {
+    nakshatra::run_all_exercises();
+    return 0;
+  }
+
+  if (arg == "--profile") {
+    return run_profile();
+  }
+
+  if (arg == "--metal") {
+    return run_metal();
+  }
+
+  if (arg == "--cpu") {
+    return run_app(false, nakshatra::WeightFormat::F32);
+  }
+
+  if (arg == "--bf16") {
+    return run_app(true, nakshatra::WeightFormat::BF16);
+  }
+
+  return run_app(true, nakshatra::WeightFormat::F32);
 }
